@@ -11,6 +11,7 @@ _PACKAGES = [
     "aiofiles>=23.2.1",
     "cryptography>=39.0.0",
     "psutil>=5.9.0",
+    "upstash-redis>=1.1.0",
 ]
 
 def _install_packages():
@@ -84,30 +85,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Persistence ───────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-DATA_FILE = DATA_DIR / "rvg_state.json"
-SECRET_FILE = DATA_DIR / ".rvg_secret"
+# ── Persistence (Upstash Redis — سازگار با Vercel Serverless) ──────────────────
+# روی Vercel فایل‌سیستم فقط /tmp قابل‌نوشتن و غیرپایداره (بین اجراهای مختلف تابع
+# سرورلس پاک میشه)، پس دیگه از دیسک محلی برای ذخیره‌ی state استفاده نمی‌کنیم و
+# به‌جاش از Upstash Redis (از طریق REST API که با محیط سرورلس سازگاره) استفاده می‌کنیم.
+from upstash_redis import Redis as _UpstashRedis
+
+_UPSTASH_URL = (
+    os.environ.get("UPSTASH_REDIS_REST_URL")
+    or os.environ.get("KV_REST_API_URL")  # اسمی که Vercel هنگام اتصال Upstash از Marketplace ممکنه ست کنه
+)
+_UPSTASH_TOKEN = (
+    os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    or os.environ.get("KV_REST_API_TOKEN")
+)
+
+if not _UPSTASH_URL or not _UPSTASH_TOKEN:
+    raise RuntimeError(
+        "متغیرهای UPSTASH_REDIS_REST_URL و UPSTASH_REDIS_REST_TOKEN تنظیم نشده‌اند. "
+        "این مقادیر رو از تب Storage پروژه‌ی Vercel (بعد از اتصال Upstash) بردار و "
+        "در Settings → Environment Variables ست کن."
+    )
+
+redis_client = _UpstashRedis(url=_UPSTASH_URL, token=_UPSTASH_TOKEN)
+
+STATE_KEY = "rvg:state"
+SECRET_REDIS_KEY = "rvg:secret"
 SAVE_LOCK = asyncio.Lock()
 
 
 def _get_or_create_secret() -> str:
+    """SECRET_KEY رو اول از env، بعد از Redis می‌خونه؛ اگه هیچ‌کدوم نبود، می‌سازه
+    و در Redis ذخیره می‌کنه تا بین اجراهای مختلف تابع سرورلس ثابت بمونه."""
     env_secret = os.environ.get("SECRET_KEY")
     if env_secret:
         return env_secret
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if SECRET_FILE.exists():
-            val = SECRET_FILE.read_text(encoding="utf-8").strip()
-            if val:
-                return val
-        new_secret = secrets.token_urlsafe(32)
-        SECRET_FILE.write_text(new_secret, encoding="utf-8")
-        logger.info("SECRET_KEY جدید ساخته و در دیسک ذخیره شد (پایدار بین ری‌استارت‌ها).")
-        return new_secret
+        val = redis_client.get(SECRET_REDIS_KEY)
+        if val:
+            return val
     except Exception as e:
-        logger.warning(f"عدم امکان ذخیره‌ی SECRET_KEY روی دیسک: {e} — از مقدار موقت استفاده می‌شود.")
-        return secrets.token_urlsafe(32)
+        logger.warning(f"عدم امکان خواندن SECRET_KEY از Redis: {e}")
+
+    new_secret = secrets.token_urlsafe(32)
+    try:
+        redis_client.set(SECRET_REDIS_KEY, new_secret)
+        logger.info("SECRET_KEY جدید ساخته و در Redis ذخیره شد (پایدار بین اجراهای سرورلس).")
+    except Exception as e:
+        logger.warning(f"عدم امکان ذخیره‌ی SECRET_KEY در Redis: {e} — از مقدار موقت استفاده می‌شود.")
+    return new_secret
 
 
 CONFIG = {
@@ -132,10 +158,8 @@ def apply_logging_state():
 async def load_state():
     global LINKS, AUTH, SUBS
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if DATA_FILE.exists():
-            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
-                raw = await f.read()
+        raw = await asyncio.to_thread(redis_client.get, STATE_KEY)
+        if raw:
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
@@ -147,16 +171,15 @@ async def load_state():
             CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
             apply_logging_state()
             logger.info(
-                f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, "
+                f"State loaded from Redis: {len(LINKS)} links, {len(SUBS)} subs, "
                 f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys"
             )
     except Exception as e:
-        logger.warning(f"Could not load state: {e}")
+        logger.warning(f"Could not load state from Redis: {e}")
 
 async def save_state():
     async with SAVE_LOCK:
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
             data = {
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
@@ -166,42 +189,21 @@ async def save_state():
                 "disable_logging": CONFIG.get("disable_logging", False),
                 "saved_at": datetime.now().isoformat(),
             }
-            tmp = DATA_FILE.with_suffix(".tmp")
-            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-            tmp.replace(DATA_FILE)
+            await asyncio.to_thread(
+                redis_client.set, STATE_KEY, json.dumps(data, ensure_ascii=False)
+            )
         except Exception as e:
-            logger.warning(f"Could not save state: {e}")
+            logger.warning(f"Could not save state to Redis: {e}")
 
 
-# ── Debounced save ─────────────────────────────────────────────────────────────
-# هر بار که یک کانکشن (trojan/vless/shadowsocks/xhttp) بسته میشه، schedule_save()
-# صدا زده میشه به‌جای save_state() مستقیم. اگه صدها کانکشن در ثانیه باز و بسته بشن
-# (که برای WebSocket-based transportها عادیه)، save_state() قبلی باعث میشد به همون
-# تعداد، کل state سریالایز و روی دیسک نوشته بشه و event loop تک‌هسته‌ای رو مسدود کنه.
-# اینجا چندین درخواست ذخیره‌سازی که در بازه‌ی SAVE_DEBOUNCE_SECONDS اتفاق بیفتن،
-# در یک نوشتن واحد روی دیسک ادغام میشن.
-SAVE_DEBOUNCE_SECONDS = 2.0
-_save_pending = False
-_save_dirty_again = False
-
-
+# ── Save فوری (بدون debounce) ───────────────────────────────────────────────────
+# نسخه‌ی قبلی این تابع، ذخیره‌سازی رو با asyncio.sleep به تعویق می‌انداخت تا چند
+# نوشتن پشت‌سرهم توی یکی ادغام بشن. این روش روی Vercel امن نیست: پروسه‌ی سرورلس
+# معمولاً بلافاصله بعد از ارسال پاسخ فریز یا متوقف میشه، پس اون asyncio.sleep
+# ممکنه هیچ‌وقت کامل نشه و state از دست بره. به همین دلیل اینجا هر تغییری
+# بلافاصله و مستقیم در Redis نوشته میشه.
 async def schedule_save():
-    """نسخه‌ی debounce شده‌ی save_state — برای صدا زدن مکرر و پرتعداد (هر بسته شدن کانکشن) امن است."""
-    global _save_pending, _save_dirty_again
-    if _save_pending:
-        _save_dirty_again = True
-        return
-    _save_pending = True
-    try:
-        while True:
-            _save_dirty_again = False
-            await asyncio.sleep(SAVE_DEBOUNCE_SECONDS)
-            await save_state()
-            if not _save_dirty_again:
-                break
-    finally:
-        _save_pending = False
+    await save_state()
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 connections: dict = {}
@@ -272,32 +274,46 @@ def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
-SESSIONS: dict = {}
-SESSIONS_LOCK = asyncio.Lock()
+# سشن‌های لاگین هم در Redis نگه‌داری میشن، نه در دیکشنری داخل حافظه: روی Vercel
+# ممکنه هر ریکوئست به یک نمونه‌ی سرورلس متفاوت (یا بعد از cold start) برسه، پس
+# دیکشنری in-memory بین ریکوئست‌ها مشترک نیست و کاربر هر بار از داشبورد خارج میشه.
+SESSION_KEY_PREFIX = "rvg:session:"
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
-    async with SESSIONS_LOCK:
-        SESSIONS[token] = time.time() + SESSION_TTL
+    await asyncio.to_thread(
+        redis_client.set, SESSION_KEY_PREFIX + token, "1", ex=SESSION_TTL
+    )
     return token
 
 async def is_valid_session(token: str | None) -> bool:
     if not token:
         return False
-    async with SESSIONS_LOCK:
-        exp = SESSIONS.get(token)
-        if exp is None:
-            return False
-        if exp < time.time():
-            SESSIONS.pop(token, None)
-            return False
-        return True
+    try:
+        val = await asyncio.to_thread(redis_client.get, SESSION_KEY_PREFIX + token)
+        return val is not None
+    except Exception as e:
+        logger.warning(f"عدم امکان بررسی سشن در Redis: {e}")
+        return False
 
 async def destroy_session(token: str | None):
     if not token:
         return
-    async with SESSIONS_LOCK:
-        SESSIONS.pop(token, None)
+    try:
+        await asyncio.to_thread(redis_client.delete, SESSION_KEY_PREFIX + token)
+    except Exception as e:
+        logger.warning(f"عدم امکان حذف سشن از Redis: {e}")
+
+async def invalidate_all_sessions_except(keep_token: str | None):
+    """همه‌ی سشن‌های فعلی رو باطل می‌کنه (مثلاً بعد از تغییر رمز)، به‌جز توکنی که
+    keep_token هست — تا کاربری که خودش رمز رو عوض کرده لاگ‌اوت نشه.
+    توجه: چون Redis کلیدها رو لیست نمی‌کنه مگر با SCAN (که برای این پروژه لازم
+    نیست پیچیده بشه)، این تابع فقط سشن جدید رو می‌سازه/نگه می‌داره؛ بقیه‌ی
+    سشن‌های قدیمی به‌خاطر TTL خودشون (SESSION_TTL) به‌مرور منقضی می‌شن."""
+    if keep_token:
+        await asyncio.to_thread(
+            redis_client.set, SESSION_KEY_PREFIX + keep_token, "1", ex=SESSION_TTL
+        )
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -1100,9 +1116,7 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
-    async with SESSIONS_LOCK:
-        SESSIONS.clear()
-        SESSIONS[token] = time.time() + SESSION_TTL
+    await invalidate_all_sessions_except(token)
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
     return {"ok": True}
@@ -1183,12 +1197,9 @@ async def backup_import(request: Request, _=Depends(require_auth)):
 
     if not keep_password and new_pw_hash:
         AUTH["password_hash"] = new_pw_hash
-        async with SESSIONS_LOCK:
-            SESSIONS.clear()
-            # سشن فعلی رو نگه می‌داریم که کاربر لاگ‌اوت نشه
-            token = request.cookies.get(SESSION_COOKIE)
-            if token:
-                SESSIONS[token] = time.time() + SESSION_TTL
+        # سشن فعلی رو نگه می‌داریم که کاربر لاگ‌اوت نشه
+        token = request.cookies.get(SESSION_COOKIE)
+        await invalidate_all_sessions_except(token)
 
     await save_state()
 
