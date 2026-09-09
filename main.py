@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import secrets
 
 _PACKAGES = [
     "fastapi==0.104.1",
@@ -112,7 +113,7 @@ redis_client = _UpstashRedis(url=_UPSTASH_URL, token=_UPSTASH_TOKEN)
 STATE_KEY = "rvg:state"
 SECRET_REDIS_KEY = "rvg:secret"
 SAVE_LOCK = asyncio.Lock()
-
+_STATE_BASE = None
 
 def _get_or_create_secret() -> str:
     """SECRET_KEY رو اول از env، بعد از Redis می‌خونه؛ اگه هیچ‌کدوم نبود، می‌سازه
@@ -156,45 +157,185 @@ def apply_logging_state():
 
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, _STATE_BASE
+
     try:
         raw = await asyncio.to_thread(redis_client.get, STATE_KEY)
+
         if raw:
             data = json.loads(raw)
+
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
             NODE_KEYS.update(data.get("node_keys", {}))
+
             for nid, n in (data.get("nodes") or {}).items():
                 NODES[nid] = _normalize_node(n)
+
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
-            apply_logging_state()
-            logger.info(
-                f"State loaded from Redis: {len(LINKS)} links, {len(SUBS)} subs, "
-                f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys"
-            )
-    except Exception as e:
-        logger.warning(f"Could not load state from Redis: {e}")
 
-async def save_state():
-    async with SAVE_LOCK:
-        try:
-            data = {
+            CONFIG["disable_logging"] = bool(
+                data.get("disable_logging", False)
+            )
+
+            # Save exactly what this instance loaded from Redis.
+            _STATE_BASE = json.loads(
+                json.dumps(data, ensure_ascii=False)
+            )
+
+            apply_logging_state()
+
+            logger.info(
+                f"State loaded from Redis: {len(LINKS)} links, "
+                f"{len(SUBS)} subs, {len(NODES)} nodes, "
+                f"{len(NODE_KEYS)} node keys"
+            )
+
+        else:
+            # Redis has no state yet. Use the current in-memory state
+            # as the baseline so the first legitimate save is allowed.
+            _STATE_BASE = {
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "node_keys": dict(NODE_KEYS),
                 "nodes": dict(NODES),
                 "password_hash": AUTH["password_hash"],
                 "disable_logging": CONFIG.get("disable_logging", False),
-                "saved_at": datetime.now().isoformat(),
             }
-            await asyncio.to_thread(
-                redis_client.set, STATE_KEY, json.dumps(data, ensure_ascii=False)
+
+    except Exception as e:
+        logger.warning(f"Could not load state from Redis: {e}")
+
+async def save_state():
+    global _STATE_BASE
+
+    async with SAVE_LOCK:
+        try:
+            # Never let an instance that has not loaded the current Redis state
+            # overwrite Redis with its own defaults/stale in-memory state.
+            if _STATE_BASE is None:
+                logger.warning("Skipping state save: Redis state has not been loaded yet.")
+                return
+
+            lock_key = f"{STATE_KEY}:lock"
+            lock_token = secrets.token_hex(16)
+
+            # Acquire a short distributed lock in Redis.
+            acquired = await asyncio.to_thread(
+                redis_client.set,
+                lock_key,
+                lock_token,
+                nx=True,
+                ex=10,
             )
+
+            if not acquired:
+                logger.warning("Could not acquire Redis state lock; skipping save.")
+                return
+
+            try:
+                raw_remote = await asyncio.to_thread(
+                    redis_client.get, STATE_KEY
+                )
+
+                if raw_remote:
+                    remote = json.loads(raw_remote)
+                else:
+                    remote = {}
+
+                base = _STATE_BASE or {}
+
+                # Start from the latest state in Redis.
+                merged = dict(remote)
+
+                # Dictionary-based state:
+                # apply only changes made by this instance since it loaded base.
+                for field_name, local_dict in (
+                    ("links", LINKS),
+                    ("subs", SUBS),
+                    ("node_keys", NODE_KEYS),
+                    ("nodes", NODES),
+                ):
+                    local_dict = dict(local_dict)
+                    base_dict = dict(base.get(field_name) or {})
+                    remote_dict = dict(remote.get(field_name) or {})
+
+                    changed_keys = set(local_dict) | set(base_dict)
+
+                    for key in changed_keys:
+                        local_exists = key in local_dict
+                        base_exists = key in base_dict
+                        remote_exists = key in remote_dict
+
+                        local_value = local_dict.get(key)
+                        base_value = base_dict.get(key)
+                        remote_value = remote_dict.get(key)
+
+                        # This instance changed this key.
+                        if local_exists != base_exists or local_value != base_value:
+                            if local_exists:
+                                # Apply our change only if the remote value
+                                # has not been changed by another instance.
+                                if (
+                                    not remote_exists
+                                    or remote_value == base_value
+                                ):
+                                    remote_dict[key] = local_value
+                            else:
+                                # We deleted this key.
+                                if (
+                                    remote_exists
+                                    and remote_value == base_value
+                                ):
+                                    del remote_dict[key]
+
+                    merged[field_name] = remote_dict
+
+                # Scalar state: only write if this instance actually changed it.
+                local_password = AUTH["password_hash"]
+                base_password = base.get("password_hash")
+
+                if local_password != base_password:
+                    merged["password_hash"] = local_password
+
+                local_logging = CONFIG.get("disable_logging", False)
+                base_logging = base.get("disable_logging", False)
+
+                if local_logging != base_logging:
+                    merged["disable_logging"] = local_logging
+
+                merged["saved_at"] = datetime.now().isoformat()
+
+                await asyncio.to_thread(
+                    redis_client.set,
+                    STATE_KEY,
+                    json.dumps(merged, ensure_ascii=False),
+                )
+
+                # Update our baseline to the state we just successfully wrote.
+                _STATE_BASE = json.loads(
+                    json.dumps(merged, ensure_ascii=False)
+                )
+
+            finally:
+                # Release the lock only if it still belongs to us.
+                try:
+                    await asyncio.to_thread(
+                        redis_client.eval,
+                        "if redis.call('GET', KEYS[1]) == ARGV[1] "
+                        "then return redis.call('DEL', KEYS[1]) "
+                        "else return 0 end",
+                        [lock_key],
+                        [lock_token],
+                    )
+                except Exception as lock_error:
+                    logger.warning(
+                        f"Could not release Redis state lock: {lock_error}"
+                    )
+
         except Exception as e:
             logger.warning(f"Could not save state to Redis: {e}")
-
 
 # ── Save فوری (بدون debounce) ───────────────────────────────────────────────────
 # نسخه‌ی قبلی این تابع، ذخیره‌سازی رو با asyncio.sleep به تعویق می‌انداخت تا چند
@@ -414,7 +555,7 @@ async def _attach_mtproto_public_proxy(uid: str, application_port: int, label: s
             LINKS[uid]["mtproto_public_port"] = pub["port"]
             LINKS[uid]["mtproto_proxy_id"] = pub["id"]
             LINKS[uid]["mtproto_public_pending"] = False
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("link", f"TCP Proxy عمومی «{label}» آماده شد ({pub['domain']}:{pub['port']})", "ok")
 
 
@@ -485,7 +626,7 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
                 uuid, inst["port"], old_proxy_id, label
             ))
 
-        asyncio.create_task(save_state())
+        await save_state()
         logger.info(
             f"MTProto[{uuid[:8]}]: ad_tag به‌روز شد، instance ری‌استارت شد "
             f"(پورت: {old_port} -> {inst['port']})"
@@ -498,7 +639,7 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
             if uuid in LINKS:
                 LINKS[uuid]["ad_tag_status"] = "error"
         log_activity("link", f"به‌روزرسانی ad_tag برای «{LINKS.get(uuid,{}).get('label','')}» ناموفق بود", "err")
-        asyncio.create_task(save_state())
+        await save_state()
 
 
 @app.on_event("shutdown")
@@ -786,7 +927,7 @@ async def ensure_default_link():
                     "sub_id": None,
                     "protocol": DEFAULT_PROTOCOL,
                 }
-                asyncio.create_task(save_state())
+                await save_state()
         _default_link_created = True
 
 # ── Basic endpoints ───────────────────────────────────────────────────────────
@@ -869,7 +1010,7 @@ async def _create_sub_core(body: dict) -> dict:
             "link_ids": [],
             "node_link_ids": [],
         }
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
     host = get_host()
     return {
@@ -954,7 +1095,7 @@ async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
                     "source": str(it.get("source") or "")[:60],
                 })
             s["foreign_links"] = clean
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True}
 
 @app.delete("/api/subs/{sub_id}")
@@ -968,7 +1109,7 @@ async def delete_sub(sub_id: str, _=Depends(require_auth)):
         for link in LINKS.values():
             if link.get("sub_id") == sub_id:
                 link["sub_id"] = None
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
     return {"ok": True, "deleted": sub_id}
 
@@ -991,7 +1132,7 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     async with LINKS_LOCK:
         if link_id in LINKS:
             LINKS[link_id]["sub_id"] = sub_id if action == "add" else None
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True}
 
 # ── مدیریت گروه از راه دور (توسط پنل مرکزی روی این نود) ──────────────────────
@@ -1307,7 +1448,7 @@ async def api_mtproto_fix_proxy(request: Request, _=Depends(require_auth)):
         })
         log_activity("link", f"TCP Proxy عمومی «{label}» ساخته شد ({pub['domain']}:{pub['port']})", "ok")
 
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True, "fixed": fixed, "failed": failed}
 
 
@@ -1450,7 +1591,7 @@ async def api_bot_tcp_proxy_attach(request: Request, _=Depends(require_auth)):
     if old_proxy_id and old_proxy_id != chosen["id"]:
         asyncio.create_task(bottokentcpproxy.delete_public_proxy(old_proxy_id))
 
-    asyncio.create_task(save_state())
+    await save_state()
     host = get_host()
     share_link = generate_share_link(uid, host, remark=f"RVG-{cur_label}", protocol="mtproto")
     if not attached_link:
@@ -1756,7 +1897,7 @@ async def _create_link_core(body: dict) -> dict:
                 if uid not in ids:
                     ids.append(uid)
 
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("link", f"کانفیگ «{label}» ساخته شد", "ok")
     host = get_host()
     return {
@@ -1916,10 +2057,10 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                     if uid in LINKS:
                         LINKS[uid]["active"] = False
                 log_activity("link", f"روشن کردن پروکسی تلگرام «{label}» ناموفق بود", "err")
-                asyncio.create_task(save_state())
+                await save_state()
                 raise HTTPException(status_code=502, detail=f"روشن کردن پروکسی تلگرام ناموفق بود: {exc}")
 
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True}
     
 # ===== Endpoint جدید برای به‌روزرسانی ad_tag =====
@@ -1976,7 +2117,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
                 ids = SUBS[sub_id].get("link_ids", [])
                 if uid in ids:
                     ids.remove(uid)
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
     return {"ok": True, "deleted": uid}
 
@@ -2148,7 +2289,7 @@ async def create_node_key(request: Request, _=Depends(require_auth)):
             "peer_host": None,
             "use_count": 0,
         }
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("node", f"کلید نود «{label}» ساخته شد", "ok")
     return {
         "ok": True, "key_id": key_id, "label": label,
@@ -2181,7 +2322,7 @@ async def update_node_key(key_id: str, request: Request, _=Depends(require_auth)
             entry["revoked"] = not bool(body.get("enabled"))
         label = entry.get("label", key_id[:8])
         revoked = entry["revoked"]
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("node", f"کلید نود «{label}» {'غیرفعال شد' if revoked else 'به‌روزرسانی شد'}",
                  "warn" if revoked else "ok")
     return {"ok": True, "key_id": key_id}
@@ -2195,7 +2336,7 @@ async def revoke_node_key(key_id: str, _=Depends(require_auth)):
             raise HTTPException(status_code=404, detail="key not found")
         label = entry.get("label", key_id[:8])
         del NODE_KEYS[key_id]
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("node", f"کلید نود «{label}» حذف شد", "warn")
     return {"ok": True, "revoked": key_id}
 
@@ -2367,7 +2508,7 @@ async def connect_node(request: Request, _=Depends(require_auth)):
     async with NODES_LOCK:
         NODES[node_id] = node
     _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("node", f"به نود «{label}» ({host}) متصل شد", "ok")
     return {"ok": True, "node": _node_public(node_id, node), "peer": info}
 
@@ -2392,7 +2533,7 @@ async def update_node(node_id: str, request: Request, _=Depends(require_auth)):
                     node["share"][p] = bool(share[p])
         snap = dict(node)
     _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
+    await save_state()
     return {"ok": True, "node": _node_public(node_id, snap)}
 
 
@@ -2403,7 +2544,7 @@ async def disconnect_node(node_id: str, _=Depends(require_auth)):
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
     _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
+    await save_state()
     log_activity("node", f"اتصال نود «{node.get('label')}» قطع شد", "warn")
     return {"ok": True, "disconnected": node_id}
 
